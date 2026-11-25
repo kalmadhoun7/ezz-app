@@ -1,0 +1,32 @@
+@import "tailwindcss";
+@import "@fontsource/cairo/400.css";
+@import "@fontsource/cairo/500.css";
+@import "@fontsource/cairo/600.css";
+@import "@fontsource/cairo/700.css";
+
+@layer base {
+  html,
+  body {
+    font-family: "Cairo", system-ui, -apple-system, sans-serif;
+    direction: rtl;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  button,
+  a,
+  input,
+  select,
+  textarea {
+    min-height: 44px;
+  }
+
+  input[type="checkbox"],
+  input[type="radio"] {
+    min-height: 22px;
+    min-width: 22px;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
