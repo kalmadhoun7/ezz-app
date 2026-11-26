@@ -23,6 +23,8 @@ export interface CycleDiscrepancyItem {
   pendingGapId?: number;
   prevUserId?: number;
   nextUserId?: number;
+  prevReadingId?: number;
+  nextReadingId?: number;
   detectedAt?: string;
 }
 
@@ -73,6 +75,7 @@ export function analyzeCycleDiscrepancies(
 
   let cursor = billPrevTenths;
   let prevUserId: number | undefined;
+  let prevReadingId: number | undefined;
 
   for (const r of effective) {
     if (r.prev_reading_tenths > cursor) {
@@ -88,6 +91,8 @@ export function analyzeCycleDiscrepancies(
           pendingGapId: pending.id,
           prevUserId,
           nextUserId: r.user_id,
+          prevReadingId,
+          nextReadingId: r.id,
           detectedAt: pending.detected_at,
         });
       } else {
@@ -99,6 +104,8 @@ export function analyzeCycleDiscrepancies(
           amountTenths: r.prev_reading_tenths - cursor,
           prevUserId,
           nextUserId: r.user_id,
+          prevReadingId,
+          nextReadingId: r.id,
           detectedAt: r.recorded_at,
         });
       }
@@ -112,12 +119,15 @@ export function analyzeCycleDiscrepancies(
         amountTenths: overlapEnd - r.prev_reading_tenths,
         prevUserId,
         nextUserId: r.user_id,
+        prevReadingId,
+        nextReadingId: r.id,
       });
     }
 
     if (r.curr_reading_tenths > cursor) {
       cursor = r.curr_reading_tenths;
       prevUserId = r.user_id;
+      prevReadingId = r.id;
     }
   }
 
@@ -208,6 +218,13 @@ export function analyzeOverflowReadings(
   };
 }
 
+export interface KwhTransferConfig {
+  sourceUserId: number;
+  /** Map of recipientUserId -> kWh tenths to transfer */
+  transfers: Record<number, number>;
+  mode: 'SHIFT_READINGS' | 'FINANCIAL_ONLY';
+}
+
 export interface CloseCycleInput {
   cycleId: number;
   billPrevTenths: number;
@@ -228,11 +245,139 @@ export interface CloseCycleInput {
   userLossAllocations: Record<number, number>; // userId -> tenths
   /** Step 2: Remaining unallocated loss kept as independent cycle item */
   unallocatedLossTenths: number;
-  /** Step 4: Discount kWh allocations per user (tenths) */
+  /** Step 3: Optional kWh transfer from 1 source user to other users */
+  kwhTransfer?: KwhTransferConfig;
+  /** Step 5: Discount kWh allocations per user (tenths) */
   userDiscountKwh: Record<number, number>;
-  /** Step 4: Surcharge mode if billAmount > expected */
+  /** Step 5: Surcharge mode if billAmount > expected */
   surchargeMode?: 'NONE' | 'RECALCULATE_RATE' | 'DISTRIBUTE_SURCHARGE';
   userSurchargesAgorot?: Record<number, number>;
+}
+
+/**
+ * Distributes transferred kWh in 0.1 kWh (1 tenth) round-robin increments across
+ * each recipient's readings, prioritizing readings immediately adjacent (before/after)
+ * to the source user's readings, and deducting from those adjacent source readings.
+ */
+export function applyRoundRobinTransferToReadings(
+  readings: Reading[],
+  sourceUserId: number,
+  transfers: Record<number, number>
+): number[] {
+  const touchedAdjacentSourceIndices: number[] = [];
+  let totalToDeduct = 0;
+
+  for (const [uidStr, rawAmount] of Object.entries(transfers)) {
+    const recipientId = Number(uidStr);
+    const amountTenths = rawAmount || 0;
+    if (amountTenths <= 0 || recipientId === sourceUserId) continue;
+
+    const recipientIndices: number[] = [];
+    for (let i = 0; i < readings.length; i++) {
+      if (readings[i].user_id === recipientId) {
+        recipientIndices.push(i);
+      }
+    }
+    if (recipientIndices.length === 0) continue;
+
+    const adjacentIndices = recipientIndices.filter(
+      (idx) =>
+        readings[idx - 1]?.user_id === sourceUserId ||
+        readings[idx + 1]?.user_id === sourceUserId
+    );
+    const otherIndices = recipientIndices.filter(
+      (idx) => !adjacentIndices.includes(idx)
+    );
+    const orderedIndices = [...adjacentIndices, ...otherIndices];
+
+    let remaining = amountTenths;
+    let pass = 0;
+    while (remaining > 0) {
+      const idx = orderedIndices[pass % orderedIndices.length];
+      readings[idx].consumption_tenths += 1;
+      remaining -= 1;
+      totalToDeduct += 1;
+      pass += 1;
+
+      if (readings[idx - 1]?.user_id === sourceUserId) {
+        touchedAdjacentSourceIndices.push(idx - 1);
+      }
+      if (readings[idx + 1]?.user_id === sourceUserId) {
+        touchedAdjacentSourceIndices.push(idx + 1);
+      }
+    }
+  }
+
+  // Deduct `totalToDeduct` from sourceUserId ensuring no reading is left with 0 < c < 3 (0.3 kWh)
+  let remainingDeduct = totalToDeduct;
+
+  // 1. First, eliminate any existing source readings < 0.3 kWh completely (if remainingDeduct allows)
+  for (let i = 0; i < readings.length && remainingDeduct > 0; i++) {
+    const r = readings[i];
+    if (
+      r.user_id === sourceUserId &&
+      r.consumption_tenths > 0 &&
+      r.consumption_tenths < 3 &&
+      r.consumption_tenths <= remainingDeduct
+    ) {
+      remainingDeduct -= r.consumption_tenths;
+      r.consumption_tenths = 0;
+    }
+  }
+
+  const adjSet = new Set(touchedAdjacentSourceIndices);
+
+  // 2. Deduct remaining tenths without leaving any reading between 0.1 and 0.2 kWh
+  while (remainingDeduct > 0) {
+    // Prefer adjacent source reading with >= 0.4 kWh (so it stays >= 0.3)
+    let pickedIdx = readings.findIndex(
+      (r, i) =>
+        adjSet.has(i) && r.user_id === sourceUserId && r.consumption_tenths >= 4
+    );
+    if (pickedIdx === -1) {
+      pickedIdx = readings.findIndex(
+        (r) => r.user_id === sourceUserId && r.consumption_tenths >= 4
+      );
+    }
+
+    if (pickedIdx !== -1) {
+      readings[pickedIdx].consumption_tenths -= 1;
+      remainingDeduct -= 1;
+      continue;
+    }
+
+    // Next, if remainingDeduct >= 3, wipe out a 0.3 kWh reading completely
+    if (remainingDeduct >= 3) {
+      const exactThreeIdx = readings.findIndex(
+        (r) => r.user_id === sourceUserId && r.consumption_tenths === 3
+      );
+      if (exactThreeIdx !== -1) {
+        readings[exactThreeIdx].consumption_tenths = 0;
+        remainingDeduct -= 3;
+        continue;
+      }
+    }
+
+    // Fallback (only if source has no >= 0.4 readings left and remainingDeduct < 3)
+    const fallbackIdx = readings.findIndex(
+      (r) => r.user_id === sourceUserId && r.consumption_tenths > 0
+    );
+    if (fallbackIdx === -1) {
+      throw new Error('رصيد المستخدم المصدر غير كافٍ لإتمام التحويل');
+    }
+    readings[fallbackIdx].consumption_tenths -= 1;
+    remainingDeduct -= 1;
+  }
+
+  // Return IDs of readings whose consumption reached 0 so callers can delete them cleanly
+  const zeroedIds: number[] = [];
+  for (let i = readings.length - 1; i >= 0; i--) {
+    if (readings[i].user_id === sourceUserId && readings[i].consumption_tenths === 0) {
+      if (readings[i].id !== undefined) zeroedIds.push(readings[i].id!);
+      readings.splice(i, 1);
+    }
+  }
+  return zeroedIds;
 }
 
 /**
@@ -466,6 +611,36 @@ export async function executeCloseCycle(input: CloseCycleInput): Promise<{
         }
       }
 
+      // 5b. Apply kWh Transfer if mode === 'SHIFT_READINGS'
+      const reallocationByUser: Record<number, number> = {};
+      if (input.kwhTransfer && input.kwhTransfer.sourceUserId) {
+        const totalTransferred = Object.values(input.kwhTransfer.transfers).reduce(
+          (s, v) => s + (v || 0),
+          0
+        );
+        if (totalTransferred > 0) {
+          if (input.kwhTransfer.mode === 'SHIFT_READINGS') {
+            const zeroedIds = applyRoundRobinTransferToReadings(
+              currentReadings,
+              input.kwhTransfer.sourceUserId,
+              input.kwhTransfer.transfers
+            );
+            for (const zid of zeroedIds) {
+              await db.readings.delete(zid);
+            }
+          } else {
+            // FINANCIAL_ONLY: leave readings untouched, store net kWh adjustment
+            reallocationByUser[input.kwhTransfer.sourceUserId] = -totalTransferred;
+            for (const [uidStr, val] of Object.entries(input.kwhTransfer.transfers)) {
+              const uid = Number(uidStr);
+              if (val > 0) {
+                reallocationByUser[uid] = (reallocationByUser[uid] ?? 0) + val;
+              }
+            }
+          }
+        }
+      }
+
       // 6. Chain Shifting from billPrevTenths
       let cursor = input.billPrevTenths;
       for (let i = 0; i < currentReadings.length; i++) {
@@ -517,17 +692,20 @@ export async function executeCloseCycle(input: CloseCycleInput): Promise<{
       const allAdjUserIds = new Set<number>([
         ...Object.keys(input.userDiscountKwh).map(Number),
         ...Object.keys(input.userSurchargesAgorot ?? {}).map(Number),
+        ...Object.keys(reallocationByUser).map(Number),
       ]);
 
       for (const uid of allAdjUserIds) {
         const disc = input.userDiscountKwh[uid] ?? 0;
         const sur = input.userSurchargesAgorot?.[uid] ?? 0;
-        if (disc > 0 || sur > 0) {
+        const realloc = reallocationByUser[uid] ?? 0;
+        if (disc > 0 || sur > 0 || realloc !== 0) {
           await db.cycle_user_adjustments.add({
             cycle_id: cycle.id!,
             user_id: uid,
             discount_kwh_tenths: disc,
             surcharge_agorot: sur,
+            reallocation_kwh_tenths: realloc,
           });
         }
       }
@@ -685,6 +863,90 @@ export async function reopenCycle(cycleId: number): Promise<void> {
         surcharge_agorot: 0,
         closed_at: null,
       });
+    }
+  );
+}
+
+/**
+ * Post-close shifting: If a closed cycle had FINANCIAL_ONLY kWh transfers
+ * (reallocation_kwh_tenths !== 0), applies the 0.1 kWh round-robin transfer
+ * and chain-shifts the closed cycle's readings so they match the financial figures.
+ */
+export async function applyPostCloseShift(cycleId: number): Promise<void> {
+  await db.transaction(
+    'rw',
+    [db.cycles, db.readings, db.cycle_user_adjustments],
+    async () => {
+      const cycle = await db.cycles.get(cycleId);
+      if (!cycle || cycle.status !== 'CLOSED') {
+        throw new Error('الدورة غير مغلقة');
+      }
+
+      const adjustments = await db.cycle_user_adjustments
+        .where('cycle_id')
+        .equals(cycleId)
+        .toArray();
+
+      const sourceAdj = adjustments.find(
+        (a) => (a.reallocation_kwh_tenths ?? 0) < 0
+      );
+      const recipientAdjs = adjustments.filter(
+        (a) => (a.reallocation_kwh_tenths ?? 0) > 0
+      );
+
+      if (!sourceAdj || recipientAdjs.length === 0) {
+        return;
+      }
+
+      const transfers: Record<number, number> = {};
+      for (const r of recipientAdjs) {
+        transfers[r.user_id] = r.reallocation_kwh_tenths!;
+      }
+
+      const mainReadings = await db.readings
+        .where('cycle_id')
+        .equals(cycleId)
+        .filter((r) => r.meter_id === cycle.meter_id)
+        .toArray();
+      mainReadings.sort(
+        (a, b) => a.sequence_order - b.sequence_order || (a.id ?? 0) - (b.id ?? 0)
+      );
+
+      const zeroedIds = applyRoundRobinTransferToReadings(
+        mainReadings,
+        sourceAdj.user_id,
+        transfers
+      );
+      for (const zid of zeroedIds) {
+        await db.readings.delete(zid);
+      }
+
+      let cursor = cycle.bill_prev_tenths ?? cycle.opening_reading_tenths;
+      for (let i = 0; i < mainReadings.length; i++) {
+        const r = mainReadings[i];
+        const prev = cursor;
+        const curr = prev + r.consumption_tenths;
+        cursor = curr;
+        await db.readings.update(r.id!, {
+          prev_reading_tenths: prev,
+          curr_reading_tenths: curr,
+          consumption_tenths: r.consumption_tenths,
+          sequence_order: i + 1,
+        });
+      }
+
+      // Clear reallocation_kwh_tenths now that readings are shifted
+      for (const adj of adjustments) {
+        if ((adj.reallocation_kwh_tenths ?? 0) !== 0 && adj.id !== undefined) {
+          if (adj.discount_kwh_tenths === 0 && adj.surcharge_agorot === 0) {
+            await db.cycle_user_adjustments.delete(adj.id);
+          } else {
+            await db.cycle_user_adjustments.update(adj.id, {
+              reallocation_kwh_tenths: 0,
+            });
+          }
+        }
+      }
     }
   );
 }

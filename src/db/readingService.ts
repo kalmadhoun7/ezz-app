@@ -508,3 +508,81 @@ export async function resolvePendingGapToUser(
     });
   });
 }
+
+/**
+ * Resolves an overlap between two consecutive readings by assigning the overlapping
+ * range [from, to] to either the previous reading ('KEEP_PREV') or the next reading ('KEEP_NEXT'),
+ * deducting the overlap from the other reading atomically.
+ */
+export async function resolveOverlapBetweenReadings(params: {
+  prevReadingId: number;
+  nextReadingId: number;
+  overlapTenths: number;
+  keepSide: 'KEEP_PREV' | 'KEEP_NEXT';
+}): Promise<void> {
+  const { prevReadingId, nextReadingId, overlapTenths, keepSide } = params;
+  if (overlapTenths <= 0) return;
+
+  await db.transaction('rw', [db.readings], async () => {
+    const prevR = await db.readings.get(prevReadingId);
+    const nextR = await db.readings.get(nextReadingId);
+    if (!prevR || !nextR) return;
+
+    if (keepSide === 'KEEP_PREV') {
+      // Keep overlap on prevR; trim start of nextR forward to prevR.curr_reading_tenths
+      const newNextPrev = Math.max(
+        nextR.prev_reading_tenths + overlapTenths,
+        Math.min(prevR.curr_reading_tenths, nextR.curr_reading_tenths)
+      );
+      const newNextConsumption = nextR.curr_reading_tenths - newNextPrev;
+      if (newNextConsumption <= 0) {
+        await db.readings.delete(nextReadingId);
+      } else {
+        await db.readings.update(nextReadingId, {
+          prev_reading_tenths: newNextPrev,
+          consumption_tenths: newNextConsumption,
+        });
+      }
+    } else {
+      // Keep overlap on nextR; deduct from prevR without shifting anyone else
+      if (
+        prevR.prev_reading_tenths < nextR.prev_reading_tenths &&
+        prevR.curr_reading_tenths > nextR.curr_reading_tenths
+      ) {
+        // prevR completely contains nextR: split prevR around [nextR.prev, nextR.curr]
+        const part1Delta = nextR.prev_reading_tenths - prevR.prev_reading_tenths;
+        const part2Delta = prevR.curr_reading_tenths - nextR.curr_reading_tenths;
+        await db.readings.update(prevReadingId, {
+          curr_reading_tenths: nextR.prev_reading_tenths,
+          consumption_tenths: part1Delta,
+        });
+        if (part2Delta > 0) {
+          await db.readings.add({
+            cycle_id: prevR.cycle_id,
+            meter_id: prevR.meter_id,
+            user_id: prevR.user_id,
+            prev_reading_tenths: nextR.curr_reading_tenths,
+            curr_reading_tenths: prevR.curr_reading_tenths,
+            consumption_tenths: part2Delta,
+            recorded_at: prevR.recorded_at,
+            notes: prevR.notes,
+            linked_sub_reading_id: null,
+            is_system_generated_from_loss: prevR.is_system_generated_from_loss,
+            sequence_order: prevR.sequence_order,
+          });
+        }
+      } else {
+        const newPrevCurr = prevR.curr_reading_tenths - overlapTenths;
+        const newPrevConsumption = newPrevCurr - prevR.prev_reading_tenths;
+        if (newPrevConsumption <= 0) {
+          await db.readings.delete(prevReadingId);
+        } else {
+          await db.readings.update(prevReadingId, {
+            curr_reading_tenths: newPrevCurr,
+            consumption_tenths: newPrevConsumption,
+          });
+        }
+      }
+    }
+  });
+}

@@ -1,8 +1,11 @@
 import React, { useMemo, useState } from 'react';
+import { useLiveQuery } from 'dexie-react-hooks';
 import {
   AlertTriangle,
+  ArrowRightLeft,
   CheckCircle2,
   Eye,
+  FileCheck2,
   Lock,
   Pencil,
   Plus,
@@ -10,12 +13,22 @@ import {
   SearchCheck,
   UserCheck,
 } from 'lucide-react';
+import { db } from '../../db/database';
 import { formatCurrency, formatDateAr, formatDateTimeAr, formatKwh } from '../../utils/format';
-import { addReading, resolvePendingGapToUser } from '../../db/readingService';
+import {
+  addReading,
+  resolveOverlapBetweenReadings,
+  resolvePendingGapToUser,
+} from '../../db/readingService';
 import { updateCycleTitle } from '../../db/cycleService';
-import { analyzeCycleDiscrepancies, reopenCycle } from '../../db/closingEngine';
+import {
+  analyzeCycleDiscrepancies,
+  applyPostCloseShift,
+  reopenCycle,
+} from '../../db/closingEngine';
 import { Modal } from '../common/Modal';
 import { PreShiftAuditModal } from './PreShiftAuditModal';
+import { FinalCycleViewModal } from './FinalCycleViewModal';
 import type { Cycle, PendingGap, Reading, Settings, User } from '../../types/models';
 
 interface CyclesTabProps {
@@ -43,11 +56,23 @@ export const CyclesTab: React.FC<CyclesTabProps> = ({
   const [assigningInternalKey, setAssigningInternalKey] = useState<string | null>(null);
   const [assignUserId, setAssignUserId] = useState<number>(users[0]?.id ?? 0);
   const [auditCycleId, setAuditCycleId] = useState<number | null>(null);
+  const [finalViewCycle, setFinalViewCycle] = useState<Cycle | null>(null);
   const [reopenError, setReopenError] = useState('');
   const [showScanResults, setShowScanResults] = useState(false);
   const [editingCycle, setEditingCycle] = useState<Cycle | null>(null);
   const [editTitleStr, setEditTitleStr] = useState('');
   const [editTitleErr, setEditTitleErr] = useState('');
+
+  const allAdjustments = useLiveQuery(() => db.cycle_user_adjustments.toArray()) ?? [];
+  const cyclesWithPendingShift = useMemo(() => {
+    const set = new Set<number>();
+    for (const a of allAdjustments) {
+      if ((a.reallocation_kwh_tenths ?? 0) !== 0) {
+        set.add(a.cycle_id);
+      }
+    }
+    return set;
+  }, [allAdjustments]);
 
   const openEditTitle = (c: Cycle) => {
     setEditingCycle(c);
@@ -219,16 +244,52 @@ export const CyclesTab: React.FC<CyclesTabProps> = ({
                     return (
                       <div
                         key={item.key}
-                        className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-900"
+                        className="space-y-2.5 rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-900"
                       >
-                        <p className="font-bold tabular-nums">
-                          تداخل في القراءات: {formatKwh(item.amountTenths)} ك.و (
-                          {formatKwh(item.fromTenths)} ← {formatKwh(item.toTenths)})
-                        </p>
-                        {(prevU || nextU) && (
-                          <p className="mt-0.5 text-[11px] text-rose-700">
-                            بين {prevU ?? '—'} و {nextU ?? '—'}
+                        <div>
+                          <p className="font-bold tabular-nums">
+                            تداخل في القراءات: {formatKwh(item.amountTenths)} ك.و (
+                            {formatKwh(item.fromTenths)} ← {formatKwh(item.toTenths)})
                           </p>
+                          {(prevU || nextU) && (
+                            <p className="mt-0.5 text-[11px] text-rose-700">
+                              بين <strong>{prevU ?? 'السابق'}</strong> و{' '}
+                              <strong>{nextU ?? 'التالي'}</strong>
+                            </p>
+                          )}
+                        </div>
+
+                        {item.prevReadingId && item.nextReadingId && (
+                          <div className="grid grid-cols-2 gap-2 border-t border-rose-200 pt-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                resolveOverlapBetweenReadings({
+                                  prevReadingId: item.prevReadingId!,
+                                  nextReadingId: item.nextReadingId!,
+                                  overlapTenths: item.amountTenths,
+                                  keepSide: 'KEEP_PREV',
+                                })
+                              }
+                              className="min-h-[44px] rounded-xl bg-rose-700 px-2.5 text-xs font-bold text-white hover:bg-rose-800"
+                            >
+                              إسناد لـ {prevU ?? 'القبل'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                resolveOverlapBetweenReadings({
+                                  prevReadingId: item.prevReadingId!,
+                                  nextReadingId: item.nextReadingId!,
+                                  overlapTenths: item.amountTenths,
+                                  keepSide: 'KEEP_NEXT',
+                                })
+                              }
+                              className="min-h-[44px] rounded-xl border border-rose-300 bg-white px-2.5 text-xs font-bold text-rose-900 hover:bg-rose-100"
+                            >
+                              إسناد لـ {nextU ?? 'البعد'}
+                            </button>
+                          </div>
                         )}
                       </div>
                     );
@@ -449,11 +510,19 @@ export const CyclesTab: React.FC<CyclesTabProps> = ({
                 <div className="flex flex-wrap gap-2 border-t border-slate-100 pt-2">
                   <button
                     type="button"
+                    onClick={() => setFinalViewCycle(c)}
+                    className="flex min-h-[44px] flex-1 items-center justify-center gap-1.5 rounded-xl border border-teal-300 bg-teal-50 px-3 text-xs font-bold text-teal-900 hover:bg-teal-100"
+                  >
+                    <FileCheck2 className="h-4 w-4" />
+                    <span>عرض النسخة النهائية</span>
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setAuditCycleId(c.id!)}
                     className="flex min-h-[44px] flex-1 items-center justify-center gap-1.5 rounded-xl border border-slate-300 bg-slate-50 px-3 text-xs font-bold text-slate-700 hover:bg-slate-100"
                   >
                     <Eye className="h-4 w-4" />
-                    <span>عرض النسخة الأصلية</span>
+                    <span>عرض النسخة الأولية</span>
                   </button>
                   <button
                     type="button"
@@ -463,6 +532,30 @@ export const CyclesTab: React.FC<CyclesTabProps> = ({
                     <RotateCcw className="h-4 w-4" />
                     <span>إعادة فتح للتعديل</span>
                   </button>
+                  {cyclesWithPendingShift.has(c.id!) && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (
+                          window.confirm(
+                            'هل تريد إزاحة قراءات هذه الدورة المغلقة الآن لتتطابق مع الكميات المحوّلة؟'
+                          )
+                        ) {
+                          try {
+                            await applyPostCloseShift(c.id!);
+                          } catch (err) {
+                            setReopenError(
+                              err instanceof Error ? err.message : 'تعذر إزاحة القراءات'
+                            );
+                          }
+                        }
+                      }}
+                      className="flex min-h-[44px] w-full items-center justify-center gap-1.5 rounded-xl bg-teal-700 px-3 text-xs font-bold text-white hover:bg-teal-800"
+                    >
+                      <ArrowRightLeft className="h-4 w-4" />
+                      <span>إزاحة القراءات الآن (تطبيق التحويل على القراءات)</span>
+                    </button>
+                  )}
                 </div>
               </div>
             ))}
@@ -474,6 +567,13 @@ export const CyclesTab: React.FC<CyclesTabProps> = ({
         cycleId={auditCycleId}
         users={users}
         onClose={() => setAuditCycleId(null)}
+      />
+
+      <FinalCycleViewModal
+        cycle={finalViewCycle}
+        users={users}
+        settings={settings}
+        onClose={() => setFinalViewCycle(null)}
       />
 
       <Modal

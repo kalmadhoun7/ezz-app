@@ -84,6 +84,8 @@ export interface CycleUserAdjustment {
   user_id: number;
   discount_kwh_tenths: number;
   surcharge_agorot: number;
+  /** Non-zero only when FINANCIAL_ONLY reallocation was applied without shifting readings yet */
+  reallocation_kwh_tenths?: number;
 }
 
 export interface Payment {

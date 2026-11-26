@@ -39,7 +39,7 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
   settings,
   onClosed,
 }) => {
-  const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
+  const [step, setStep] = useState<1 | 2 | 3 | 4 | 5>(1);
 
   // Step 1 state
   const lastMainCurr =
@@ -85,6 +85,10 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
       setBillAmountManual(false);
       setUserLossAllocations({});
       setUserLossStrs({});
+      setTransferSourceUserId(0);
+      setUserTransfers({});
+      setUserTransferStrs({});
+      setTransferMode('SHIFT_READINGS');
       setUserDiscountKwh({});
       setUserDiscountStrs({});
       setUserSurchargesAgorot({});
@@ -103,7 +107,15 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
   const [userLossStrs, setUserLossStrs] = useState<Record<number, string>>({});
   const [keepUnallocated, setKeepUnallocated] = useState(false);
 
-  // Step 4 state
+  // Step 3 state (Optional kWh Transfer from 1 source user to other users with readings)
+  const [transferSourceUserId, setTransferSourceUserId] = useState<number>(0);
+  const [userTransfers, setUserTransfers] = useState<Record<number, number>>({});
+  const [userTransferStrs, setUserTransferStrs] = useState<Record<number, string>>({});
+  const [transferMode, setTransferMode] = useState<'SHIFT_READINGS' | 'FINANCIAL_ONLY'>(
+    'SHIFT_READINGS'
+  );
+
+  // Step 5 state (Financial Reconciliation)
   const [userDiscountKwh, setUserDiscountKwh] = useState<Record<number, number>>({});
   const [userDiscountStrs, setUserDiscountStrs] = useState<Record<number, string>>({});
   const [surchargeMode, setSurchargeMode] = useState<
@@ -187,6 +199,74 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
     return map;
   }, [overflow, billCurrTenths, discrepancyReport, gapAssignments, slotGapAssignments, userLossAllocations]);
 
+  // Users who actually have readings (or allocated consumption) in this cycle
+  const usersWithCycleConsumption = useMemo(
+    () => users.filter((u) => (projectedUserKwh.get(u.id!) ?? 0) > 0),
+    [users, projectedUserKwh]
+  );
+
+  // Per-user list of individual reading quantities (tenths) in this cycle
+  const userReadingQuantities = useMemo(() => {
+    const map = new Map<number, number[]>();
+    const pushVal = (uid: number, val: number) => {
+      if (val <= 0) return;
+      const arr = map.get(uid) ?? [];
+      arr.push(val);
+      map.set(uid, arr);
+    };
+    for (const r of overflow.inCycleReadings) {
+      pushVal(r.user_id, r.consumption_tenths);
+    }
+    for (const r of overflow.straddling) {
+      pushVal(r.user_id, Math.max(0, billCurrTenths - r.prev_reading_tenths));
+    }
+    for (const item of discrepancyReport.items) {
+      if (item.kind === 'OVERLAP') continue;
+      const uid = item.pendingGapId
+        ? gapAssignments[item.pendingGapId]
+        : slotGapAssignments[item.key];
+      if (uid) pushVal(uid, item.amountTenths);
+    }
+    for (const [uidStr, tenths] of Object.entries(userLossAllocations)) {
+      const uid = Number(uidStr);
+      if (tenths > 0) pushVal(uid, tenths);
+    }
+    return map;
+  }, [overflow, billCurrTenths, discrepancyReport, gapAssignments, slotGapAssignments, userLossAllocations]);
+
+  const totalTransferredTenths = useMemo(
+    () =>
+      Object.entries(userTransfers).reduce(
+        (s, [uidStr, v]) =>
+          Number(uidStr) !== transferSourceUserId ? s + (v || 0) : s,
+        0
+      ),
+    [userTransfers, transferSourceUserId]
+  );
+
+  const sourceUserAvailableTenths = transferSourceUserId
+    ? projectedUserKwh.get(transferSourceUserId) ?? 0
+    : 0;
+  const remainingSourceTenths = sourceUserAvailableTenths - totalTransferredTenths;
+
+  // Final effective kWh per user after Step 3 transfer (used in Step 4 Preview & Step 5 Financial Reconciliation)
+  const effectiveUserKwh = useMemo(() => {
+    const map = new Map<number, number>(projectedUserKwh);
+    if (transferSourceUserId && totalTransferredTenths > 0) {
+      map.set(
+        transferSourceUserId,
+        Math.max(0, (map.get(transferSourceUserId) ?? 0) - totalTransferredTenths)
+      );
+      for (const [uidStr, val] of Object.entries(userTransfers)) {
+        const uid = Number(uidStr);
+        if (uid !== transferSourceUserId && val > 0) {
+          map.set(uid, (map.get(uid) ?? 0) + val);
+        }
+      }
+    }
+    return map;
+  }, [projectedUserKwh, transferSourceUserId, userTransfers, totalTransferredTenths]);
+
   const financialDiff = useMemo(
     () =>
       computeCycleFinancialDiff(
@@ -235,7 +315,7 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
   };
 
   const handleAutoDistributeSurcharge = () => {
-    const items = Array.from(projectedUserKwh.entries()).map(([uid, kwh]) => ({
+    const items = Array.from(effectiveUserKwh.entries()).map(([uid, kwh]) => ({
       id: uid,
       weight: kwh,
     }));
@@ -304,6 +384,16 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
 
     setSubmitting(true);
     try {
+      const cleanTransfers: Record<number, number> = {};
+      if (transferSourceUserId && totalTransferredTenths > 0) {
+        for (const [uidStr, val] of Object.entries(userTransfers)) {
+          const uid = Number(uidStr);
+          if (uid !== transferSourceUserId && val > 0) {
+            cleanTransfers[uid] = val;
+          }
+        }
+      }
+
       await executeCloseCycle({
         cycleId: cycle.id!,
         billPrevTenths,
@@ -317,6 +407,14 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
         unallocatedLossTenths: keepUnallocated
           ? Math.max(0, remainingLossToAllocateTenths)
           : 0,
+        kwhTransfer:
+          transferSourceUserId && totalTransferredTenths > 0
+            ? {
+                sourceUserId: transferSourceUserId,
+                transfers: cleanTransfers,
+                mode: transferMode,
+              }
+            : undefined,
         userDiscountKwh,
         surchargeMode:
           financialDiff.surchargeAgorot > 0 ? surchargeMode : 'NONE',
@@ -339,13 +437,13 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
     <Modal
       open={open}
       onClose={onClose}
-      title={`معالج إقفال الدورة — خطوة ${step} من 4`}
+      title={`معالج إقفال الدورة — خطوة ${step} من 5`}
       maxWidthClass="max-w-xl"
     >
       <div className="space-y-4">
         {/* Progress Bar */}
-        <div className="grid grid-cols-4 gap-1.5">
-          {[1, 2, 3, 4].map((s) => (
+        <div className="grid grid-cols-5 gap-1.5">
+          {[1, 2, 3, 4, 5].map((s) => (
             <div
               key={s}
               className={`h-1.5 rounded-full ${
@@ -753,11 +851,149 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
           </div>
         )}
 
-        {/* STEP 3: SILENT SNAPSHOT & SHIFTING PREVIEW */}
+        {/* STEP 3: OPTIONAL KWH TRANSFER BETWEEN USERS */}
         {step === 3 && (
           <div className="space-y-4">
+            <div className="flex items-center justify-between gap-2">
+              <h4 className="text-sm font-bold text-slate-900">
+                3. تحويل كميات بين المستخدمين (اختياري)
+              </h4>
+              {transferSourceUserId > 0 && (
+                <span
+                  className={`rounded-full px-3 py-1 text-xs font-bold tabular-nums ${
+                    remainingSourceTenths < 0
+                      ? 'bg-rose-100 text-rose-800'
+                      : 'bg-teal-100 text-teal-900'
+                  }`}
+                >
+                  المتبقي للمصدر: {formatKwh(remainingSourceTenths)} ك.و
+                </span>
+              )}
+            </div>
+
+            <div className="space-y-2 rounded-xl border border-slate-200 bg-slate-50 p-3">
+              <label className="block text-xs font-bold text-slate-700">
+                اختر المستخدم المخصوم منه (المصدر):
+              </label>
+              <select
+                value={transferSourceUserId || ''}
+                onChange={(e) => {
+                  const uid = e.target.value ? Number(e.target.value) : 0;
+                  setTransferSourceUserId(uid);
+                  setUserTransfers({});
+                  setUserTransferStrs({});
+                }}
+                className="min-h-[44px] w-full rounded-xl border border-slate-300 bg-white px-3 text-sm font-bold text-slate-900"
+              >
+                <option value="">بدون تحويل (تخطي هذه الخطوة)</option>
+                {usersWithCycleConsumption.map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.name} — ({formatKwh(projectedUserKwh.get(u.id!) ?? 0)} ك.و)
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {transferSourceUserId > 0 && (
+              <>
+                <div className="space-y-2 rounded-xl border border-slate-200 bg-white p-3">
+                  <p className="text-xs font-bold text-slate-700">
+                    طريقة تطبيق التحويل:
+                  </p>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <button
+                      type="button"
+                      onClick={() => setTransferMode('SHIFT_READINGS')}
+                      className={`min-h-[44px] rounded-xl border px-3 py-2 text-xs font-bold transition ${
+                        transferMode === 'SHIFT_READINGS'
+                          ? 'border-teal-700 bg-teal-700 text-white'
+                          : 'border-slate-300 bg-slate-50 text-slate-700'
+                      }`}
+                    >
+                      إزاحة وتعديل القراءات (0.1 بالتناوب)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTransferMode('FINANCIAL_ONLY')}
+                      className={`min-h-[44px] rounded-xl border px-3 py-2 text-xs font-bold transition ${
+                        transferMode === 'FINANCIAL_ONLY'
+                          ? 'border-teal-700 bg-teal-700 text-white'
+                          : 'border-slate-300 bg-slate-50 text-slate-700'
+                      }`}
+                    >
+                      المطابقة المالية فقط (ترك القراءات كما هي)
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <p className="text-xs font-bold text-slate-700">
+                    أدخل الكمية المراد إضافتها لباقي المستخدمين (أصحاب القراءات في الدورة):
+                  </p>
+                  {usersWithCycleConsumption
+                    .filter((u) => u.id !== transferSourceUserId)
+                    .map((u) => {
+                      const uid = u.id!;
+                      const currentKwh = projectedUserKwh.get(uid) ?? 0;
+                      const quantities = userReadingQuantities.get(uid) ?? [];
+                      const addedVal = userTransfers[uid] ?? 0;
+                      return (
+                        <div
+                          key={uid}
+                          className="flex items-center justify-between gap-2 rounded-xl border border-slate-200 bg-white p-2.5"
+                        >
+                          <div className="min-w-0 flex-1 text-xs">
+                            <p className="font-bold text-slate-900">{u.name}</p>
+                            {quantities.length > 0 && (
+                              <p className="mt-0.5 flex flex-wrap items-center gap-1 text-[11px] tabular-nums text-slate-600">
+                                {quantities.map((q, idx) => (
+                                  <span
+                                    key={idx}
+                                    className="rounded-md bg-slate-100 px-1.5 py-0.5 font-semibold"
+                                  >
+                                    {formatKwh(q)}
+                                  </span>
+                                ))}
+                                <span className="font-bold text-teal-800">
+                                  = {formatKwh(currentKwh)} ك.و
+                                </span>
+                              </p>
+                            )}
+                            {addedVal > 0 && (
+                              <p className="mt-0.5 text-[11px] font-bold text-emerald-700 tabular-nums">
+                                بعد الإضافة: {formatKwh(currentKwh + addedVal)} ك.و
+                              </p>
+                            )}
+                          </div>
+                          <div className="w-32 shrink-0">
+                            <NumericInput
+                              value={
+                                userTransferStrs[uid] ??
+                                (addedVal ? formatKwh(addedVal) : '')
+                              }
+                              placeholder="0.0"
+                              onChange={(str) => {
+                                const parsed = parseKwhToTenths(str) ?? 0;
+                                setUserTransferStrs((p) => ({ ...p, [uid]: str }));
+                                setUserTransfers((p) => ({ ...p, [uid]: parsed }));
+                              }}
+                              suffix="ك.و"
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* STEP 4: SILENT SNAPSHOT & SHIFTING PREVIEW */}
+        {step === 4 && (
+          <div className="space-y-4">
             <h4 className="text-sm font-bold text-slate-900">
-              3. معاينة الدمج السلس والنسخة الأصلية الصامتة
+              4. معاينة الدمج السلس والنسخة الأصلية الصامتة
             </h4>
 
             <div className="rounded-xl border border-teal-200 bg-teal-50 p-3.5 text-xs leading-relaxed text-teal-900">
@@ -783,7 +1019,7 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
               <p className="text-xs font-bold text-slate-700">
                 ملخص الاستهلاك النهائي للمستخدمين في الدورة:
               </p>
-              {Array.from(projectedUserKwh.entries()).map(([uid, kwh]) => {
+              {Array.from(effectiveUserKwh.entries()).map(([uid, kwh]) => {
                 const u = users.find((x) => x.id === uid);
                 return (
                   <div
@@ -801,11 +1037,11 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
           </div>
         )}
 
-        {/* STEP 4: FINANCIAL RECONCILIATION */}
-        {step === 4 && (
+        {/* STEP 5: FINANCIAL RECONCILIATION */}
+        {step === 5 && (
           <div className="space-y-4">
             <h4 className="text-sm font-bold text-slate-900">
-              4. المطابقة المالية (الخصومات والزيادات)
+              5. المطابقة المالية (الخصومات والزيادات)
             </h4>
 
             <div className="grid grid-cols-2 gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs">
@@ -858,7 +1094,7 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
                 </div>
 
                 <div className="space-y-2">
-                  {Array.from(projectedUserKwh.entries()).map(([uid, maxKwh]) => {
+                  {Array.from(effectiveUserKwh.entries()).map(([uid, maxKwh]) => {
                     const u = users.find((x) => x.id === uid);
                     const discVal = userDiscountKwh[uid] ?? 0;
                     return (
@@ -948,7 +1184,7 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
                       المتبقي للتوزيع: {formatCurrency(remainingSurchargeAgorot)}{' '}
                       {settings.currency_symbol}
                     </p>
-                    {Array.from(projectedUserKwh.keys()).map((uid) => {
+                    {Array.from(effectiveUserKwh.keys()).map((uid) => {
                       const u = users.find((x) => x.id === uid);
                       const val = userSurchargesAgorot[uid] ?? 0;
                       return (
@@ -1001,7 +1237,7 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
                 if (step === 2 && step2Phase === 'DISTRIBUTE') {
                   setStep2Phase('AUDIT');
                 } else {
-                  setStep((s) => (s - 1) as 1 | 2 | 3 | 4);
+                  setStep((s) => (s - 1) as 1 | 2 | 3 | 4 | 5);
                 }
               }}
               className="flex min-h-[44px] items-center gap-1 rounded-xl border border-slate-300 px-4 text-sm font-bold text-slate-700"
@@ -1013,7 +1249,7 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
             <div />
           )}
 
-          {step < 4 ? (
+          {step < 5 ? (
             <button
               type="button"
               onClick={() => {
@@ -1028,8 +1264,12 @@ export const ClosingWizardModal: React.FC<ClosingWizardModalProps> = ({
                   return;
                 }
                 if (step === 2 && !validateStep2()) return;
+                if (step === 3 && transferSourceUserId > 0 && remainingSourceTenths < 0) {
+                  setError('مجموع الكميات المحوّلة يتجاوز رصيد المستخدم المصدر');
+                  return;
+                }
                 setError('');
-                setStep((s) => (s + 1) as 1 | 2 | 3 | 4);
+                setStep((s) => (s + 1) as 1 | 2 | 3 | 4 | 5);
               }}
               className="flex min-h-[44px] items-center gap-1 rounded-xl bg-teal-700 px-5 text-sm font-bold text-white hover:bg-teal-800"
             >

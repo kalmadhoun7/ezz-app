@@ -94,13 +94,14 @@ export async function getCycleOrDateRangeReport(params: {
 
   const adjMap = new Map(adjustments.map((a) => [`${a.user_id}:${a.cycle_id}`, a]));
 
-  for (const [key, kwh] of byUserCycle.entries()) {
+  for (const [key, rawKwh] of byUserCycle.entries()) {
     const [uidStr, cidStr] = key.split(':');
     const uid = Number(uidStr);
     const cid = Number(cidStr);
     const cyc = cycleMap.get(cid);
     const rate = cyc?.kwh_price_agorot ?? 0;
     const adj = adjMap.get(key);
+    const kwh = Math.max(0, rawKwh + (adj?.reallocation_kwh_tenths ?? 0));
     const disc = adj?.discount_kwh_tenths ?? 0;
     const sur = adj?.surcharge_agorot ?? 0;
     const netKwh = Math.max(0, kwh - disc);
@@ -150,10 +151,11 @@ export async function getCycleOrDateRangeReport(params: {
   for (const adj of adjustments) {
     if (!closedCycleIds.has(adj.cycle_id)) continue;
     const cyc = cycleMap.get(adj.cycle_id)!;
+    const reallocValue = computeAmountAgorot(adj.reallocation_kwh_tenths ?? 0, cyc.kwh_price_agorot);
     const discValue = computeAmountAgorot(adj.discount_kwh_tenths, cyc.kwh_price_agorot);
     closedDueByUser.set(
       adj.user_id,
-      (closedDueByUser.get(adj.user_id) ?? 0) - discValue + adj.surcharge_agorot
+      (closedDueByUser.get(adj.user_id) ?? 0) + reallocValue - discValue + adj.surcharge_agorot
     );
   }
 
@@ -262,8 +264,9 @@ export async function getUserFullStatement(userId: number): Promise<{
     const cycReadings = readings.filter(
       (r) => r.cycle_id === c.id && mainMeterIds.has(r.meter_id)
     );
-    const kwh = cycReadings.reduce((s, r) => s + r.consumption_tenths, 0);
+    const rawKwh = cycReadings.reduce((s, r) => s + r.consumption_tenths, 0);
     const adj = adjByCycle.get(c.id!);
+    const kwh = Math.max(0, rawKwh + (adj?.reallocation_kwh_tenths ?? 0));
     const disc = adj?.discount_kwh_tenths ?? 0;
     const sur = adj?.surcharge_agorot ?? 0;
 

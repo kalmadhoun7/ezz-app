@@ -97,8 +97,9 @@ export async function getUserFinancialSummary(userId: number): Promise<UserFinan
     const cycleReadings = allUserReadings.filter(
       (r) => r.cycle_id === cycle.id && mainMeterIds.has(r.meter_id)
     );
-    const totalKwhTenths = cycleReadings.reduce((sum, r) => sum + r.consumption_tenths, 0);
+    const rawKwhTenths = cycleReadings.reduce((sum, r) => sum + r.consumption_tenths, 0);
     const adj = adjByCycle.get(cycle.id!);
+    const totalKwhTenths = Math.max(0, rawKwhTenths + (adj?.reallocation_kwh_tenths ?? 0));
     const discountTenths = adj?.discount_kwh_tenths ?? 0;
     const surchargeAgorot = adj?.surcharge_agorot ?? 0;
 

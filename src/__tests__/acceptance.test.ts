@@ -4,7 +4,12 @@ import { addMeter } from '../db/meterService';
 import { addUser, getUserFinancialSummary } from '../db/userService';
 import { openNewCycle, getLastReadingForMeter } from '../db/cycleService';
 import { addReading, detectMainMeterGap } from '../db/readingService';
-import { executeCloseCycle, reopenCycle, computeCycleFinancialDiff } from '../db/closingEngine';
+import {
+  applyPostCloseShift,
+  computeCycleFinancialDiff,
+  executeCloseCycle,
+  reopenCycle,
+} from '../db/closingEngine';
 import { addPayment } from '../db/paymentService';
 import { updateSettings } from '../db/settingsService';
 import { getCycleOrDateRangeReport, getReadingRangeReport, buildInvoiceMessage } from '../db/reportService';
@@ -398,5 +403,57 @@ describe('SRS Section 6 — 7 Acceptance Criteria', () => {
     const restoredClosedCycle = await db.cycles.get(cycleId);
     expect(restoredClosedCycle?.status).toBe('CLOSED');
     expect((await db.users.count())).toBe(1);
+  });
+
+  it('AC-8: kWh transfer (0.1 round-robin adjacent priority) & post-close shift', async () => {
+    const mainId = (await db.meters.where('type').equals('MAIN').first())!.id!;
+    const sourceU = await addUser({ name: 'عمارة الحرمين' });
+    const recipU = await addUser({ name: 'الترتوري' });
+    const cycleId = await openNewCycle({
+      meter_id: mainId,
+      opening_reading_tenths: 10000,
+      kwh_price_agorot: 1000,
+    });
+
+    // recipU has 3 readings: R1 (not adjacent), R2 (adjacent before source), R3 (not adjacent)
+    await addReading({ cycle_id: cycleId, meter_id: mainId, user_id: recipU, prev_reading_tenths: 10000, curr_reading_tenths: 10010, recorded_at: '2026-11-21T01:00:00.000Z' });
+    await addReading({ cycle_id: cycleId, meter_id: mainId, user_id: sourceU, prev_reading_tenths: 10010, curr_reading_tenths: 10050, recorded_at: '2026-11-21T02:00:00.000Z' });
+    await addReading({ cycle_id: cycleId, meter_id: mainId, user_id: recipU, prev_reading_tenths: 10050, curr_reading_tenths: 10060, recorded_at: '2026-11-21T03:00:00.000Z' });
+
+    // Close with FINANCIAL_ONLY transferring 0.2 kWh from sourceU to recipU
+    await executeCloseCycle({
+      cycleId,
+      billPrevTenths: 10000,
+      billCurrTenths: 10060,
+      billKwhTenths: 60,
+      billAmountAgorot: 6000,
+      endDate: '2026-11-28T10:00:00.000Z',
+      gapAssignments: {},
+      userLossAllocations: {},
+      unallocatedLossTenths: 0,
+      kwhTransfer: {
+        sourceUserId: sourceU,
+        transfers: { [recipU]: 2 }, // 0.2 kWh
+        mode: 'FINANCIAL_ONLY',
+      },
+      userDiscountKwh: {},
+    });
+
+    // Report shows combined kWh (recipU: 2.0 + 0.2 = 2.2, sourceU: 4.0 - 0.2 = 3.8)
+    const rep = await getCycleOrDateRangeReport({ mainMeterId: mainId, cycleId });
+    expect(rep.rows.find((r) => r.userId === recipU)!.consumptionTenths).toBe(22);
+    expect(rep.rows.find((r) => r.userId === sourceU)!.consumptionTenths).toBe(38);
+
+    // Readings were NOT shifted yet
+    const preShiftReadings = await db.readings.where('cycle_id').equals(cycleId).sortBy('sequence_order');
+    expect(preShiftReadings[1].consumption_tenths).toBe(40);
+
+    // Now apply post-close shift
+    await applyPostCloseShift(cycleId);
+    const postShiftReadings = await db.readings.where('cycle_id').equals(cycleId).sortBy('sequence_order');
+    expect(postShiftReadings[0].consumption_tenths).toBe(11); // +0.1
+    expect(postShiftReadings[1].consumption_tenths).toBe(38); // -0.2
+    expect(postShiftReadings[2].consumption_tenths).toBe(11); // +0.1
+    expect(postShiftReadings[2].curr_reading_tenths).toBe(10060);
   });
 });

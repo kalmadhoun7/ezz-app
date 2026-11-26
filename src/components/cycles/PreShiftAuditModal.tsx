@@ -34,7 +34,7 @@ export const PreShiftAuditModal: React.FC<PreShiftAuditModalProps> = ({
     <Modal
       open={cycleId !== null}
       onClose={onClose}
-      title="النسخة الأصلية قبل الإزاحة (للمدير فقط)"
+      title="النسخة الأولية قبل الإزاحة (للمدير فقط)"
       maxWidthClass="max-w-xl"
     >
       {loading ? (
@@ -50,7 +50,14 @@ export const PreShiftAuditModal: React.FC<PreShiftAuditModalProps> = ({
               القراءات الأصلية ({payload.readings.length})
             </h4>
             <div className="space-y-1.5">
-              {payload.readings.map((r) => (
+              {[...payload.readings]
+                .sort(
+                  (a, b) =>
+                    a.prev_reading_tenths - b.prev_reading_tenths ||
+                    a.curr_reading_tenths - b.curr_reading_tenths ||
+                    (a.id ?? 0) - (b.id ?? 0)
+                )
+                .map((r) => (
                 <div
                   key={r.id}
                   className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 p-2.5"
