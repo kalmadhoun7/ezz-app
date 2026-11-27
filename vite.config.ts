@@ -4,6 +4,7 @@ import tailwindcss from '@tailwindcss/vite';
 import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig({
+  base: '/ezz-app/',
   plugins: [
     react(),
     tailwindcss(),
@@ -19,16 +20,17 @@ export default defineConfig({
         display: 'standalone',
         dir: 'rtl',
         lang: 'ar',
-        start_url: '/',
+        scope: '/ezz-app/',
+        start_url: '/ezz-app/',
         icons: [
           {
-            src: '/icons/icon-192.svg',
+            src: 'icons/icon-192.svg',
             sizes: '192x192',
             type: 'image/svg+xml',
             purpose: 'any maskable',
           },
           {
-            src: '/icons/icon-512.svg',
+            src: 'icons/icon-512.svg',
             sizes: '512x512',
             type: 'image/svg+xml',
             purpose: 'any maskable',
