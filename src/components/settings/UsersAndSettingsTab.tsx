@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   Banknote,
   Download,
+  RefreshCw,
   Upload,
 } from 'lucide-react';
 import { NumericInput } from '../common/NumericInput';
@@ -79,6 +80,47 @@ export const UsersAndSettingsTab: React.FC<UsersAndSettingsTabProps> = ({
   const [applyToOpen, setApplyToOpen] = useState(false);
   const [settingsMsg, setSettingsMsg] = useState('');
   const [settingsErr, setSettingsErr] = useState('');
+  const [updateStatus, setUpdateStatus] = useState('');
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+
+  const handleCheckForUpdate = async () => {
+    setUpdateStatus('');
+    if (!navigator.onLine) {
+      setUpdateStatus('أنت غير متصل بالإنترنت حالياً. وصّل الإنترنت للتحقق من التحديثات.');
+      return;
+    }
+    if (!('serviceWorker' in navigator)) {
+      setUpdateStatus('التحديث التلقائي غير مدعوم في هذا المتصفح.');
+      return;
+    }
+    setCheckingUpdate(true);
+    try {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (!reg) {
+        setUpdateStatus('لا توجد تحديثات جديدة (التطبيق يعمل بالوضع المحلي).');
+        return;
+      }
+      await reg.update();
+      if (reg.waiting || reg.installing) {
+        setUpdateStatus('تم العثور على تحديث جديد! جارٍ تحديث التطبيق الآن...');
+        const target = reg.waiting || reg.installing;
+        if (target) {
+          target.addEventListener('statechange', () => {
+            if (target.state === 'activated') {
+              window.location.reload();
+            }
+          });
+        }
+        setTimeout(() => window.location.reload(), 1500);
+      } else {
+        setUpdateStatus('أنت تستخدم أحدث نسخة من التطبيق حالياً (لا توجد تحديثات جديدة).');
+      }
+    } catch {
+      setUpdateStatus('تعذر التحقق من التحديثات. تأكد من الاتصال بالإنترنت وحاول مجدداً.');
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
 
   const handleSaveUser = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -617,6 +659,28 @@ export const UsersAndSettingsTab: React.FC<UsersAndSettingsTabProps> = ({
                 />
               </label>
             </div>
+          </div>
+
+          {/* App Update Check */}
+          <div className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-xs">
+            <h3 className="text-sm font-bold text-slate-900">تحديثات التطبيق</h3>
+            <p className="text-xs text-slate-500">
+              تحقق من وجود نسخة أحدث للتطبيق عند توفر الإنترنت دون التأثير على بياناتك.
+            </p>
+            <button
+              type="button"
+              disabled={checkingUpdate}
+              onClick={handleCheckForUpdate}
+              className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl border border-teal-300 bg-teal-50 px-4 text-xs font-bold text-teal-900 transition hover:bg-teal-100 disabled:opacity-50"
+            >
+              <RefreshCw className={`h-4 w-4 ${checkingUpdate ? 'animate-spin' : ''}`} />
+              <span>{checkingUpdate ? 'جارٍ التحقق...' : 'التحقق من وجود تحديث'}</span>
+            </button>
+            {updateStatus && (
+              <p className="rounded-xl bg-slate-50 p-2.5 text-xs font-semibold text-slate-800">
+                {updateStatus}
+              </p>
+            )}
           </div>
         </div>
       )}
