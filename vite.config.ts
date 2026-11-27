@@ -12,9 +12,9 @@ export default defineConfig({
       registerType: 'autoUpdate',
       includeAssets: ['favicon.svg', 'icons/icon-192.svg', 'icons/icon-512.svg'],
       manifest: {
-        name: 'دفتر العداد المشترك — SML',
-        short_name: 'العداد المشترك',
-        description: 'نظام إدارة ومحاسبة قراءات عدادات الكهرباء المشتركة أوفلاين',
+        name: 'حاسبة العداد المشترك',
+        short_name: 'حاسبة العداد',
+        description: 'إدارة ومحاسبة قراءات عداد الكهرباء المشترك أوفلاين',
         theme_color: '#0f766e',
         background_color: '#f8fafc',
         display: 'standalone',

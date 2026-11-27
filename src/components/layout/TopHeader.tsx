@@ -21,7 +21,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
             <Zap className="h-5 w-5 text-teal-200" />
           </div>
           <div>
-            <h1 className="text-sm font-bold leading-tight">دفتر العداد المشترك</h1>
+            <h1 className="text-sm font-bold leading-tight">حاسبة العداد المشترك</h1>
             <p className="text-[11px] text-teal-100">يعمل أوفلاين 100%</p>
           </div>
         </div>
