@@ -253,4 +253,64 @@ describe('Phase 1 — Core Math, Digits & Data Layer', () => {
     expect(afterDeductNext[1].curr_reading_tenths).toBe(16251);
     expect(afterDeductNext[1].consumption_tenths).toBe(27); // 3.5 - 0.8 = 2.7 kWh
   });
+
+  it('auto-reconciles PENDING gaps when a new reading partially or fully covers the gap range', async () => {
+    const mainMeters = await db.meters.where('type').equals('MAIN').toArray();
+    const mainId = mainMeters[0].id!;
+    const u1 = await addUser({ name: 'مستخدم 1' });
+    const cycleId = await openNewCycle({
+      meter_id: mainId,
+      opening_reading_tenths: 16924, // 1692.4
+    });
+
+    // Create a 3.0 kWh pending gap (1692.4 -> 1695.4)
+    await addReading(
+      {
+        cycle_id: cycleId,
+        meter_id: mainId,
+        user_id: u1,
+        prev_reading_tenths: 16954,
+        curr_reading_tenths: 16960,
+        recorded_at: '2026-11-27T13:42:00.000Z',
+      },
+      { mode: 'PENDING_GAP' }
+    );
+    expect((await db.pending_gaps.where('status').equals('PENDING').count())).toBe(1);
+
+    // Add a reading covering 1.0 kWh of the gap (1692.4 -> 1693.4)
+    await addReading(
+      {
+        cycle_id: cycleId,
+        meter_id: mainId,
+        user_id: u1,
+        prev_reading_tenths: 16924,
+        curr_reading_tenths: 16934,
+        recorded_at: '2026-11-27T14:00:00.000Z',
+      },
+      { mode: 'NONE' },
+      'KEEP_AS_IS'
+    );
+
+    const remainingGaps = await db.pending_gaps.where('status').equals('PENDING').toArray();
+    expect(remainingGaps.length).toBe(1);
+    expect(remainingGaps[0].from_reading_tenths).toBe(16934);
+    expect(remainingGaps[0].to_reading_tenths).toBe(16954);
+    expect(remainingGaps[0].gap_tenths).toBe(20); // 2.0 kWh left
+
+    // Add a reading covering the remaining 2.0 kWh (1693.4 -> 1695.4)
+    await addReading(
+      {
+        cycle_id: cycleId,
+        meter_id: mainId,
+        user_id: u1,
+        prev_reading_tenths: 16934,
+        curr_reading_tenths: 16954,
+        recorded_at: '2026-11-27T14:10:00.000Z',
+      },
+      { mode: 'NONE' },
+      'KEEP_AS_IS'
+    );
+
+    expect((await db.pending_gaps.where('status').equals('PENDING').count())).toBe(0);
+  });
 });

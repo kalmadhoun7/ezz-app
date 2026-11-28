@@ -1,5 +1,6 @@
 import Dexie, { type EntityTable } from 'dexie';
 import { formatDateSlash } from '../utils/format';
+import { reconcilePendingGapsWithReading } from './readingService';
 import type {
   Cycle,
   CycleSnapshot,
@@ -45,7 +46,7 @@ export const db = new SmlDatabase();
  * Ensures default settings and an initial main meter exist on first launch.
  */
 export async function ensureInitialData(): Promise<void> {
-  await db.transaction('rw', [db.settings, db.meters, db.cycles], async () => {
+  await db.transaction('rw', [db.settings, db.meters, db.cycles, db.readings, db.pending_gaps], async () => {
     const existingSettings = await db.settings.get(1);
     if (!existingSettings) {
       await db.settings.put({
@@ -92,6 +93,35 @@ export async function ensureInitialData(): Promise<void> {
       }
       if (typeof localStorage !== 'undefined') {
         localStorage.setItem(migrationKey, '1');
+      }
+    }
+
+    // One-time cleanup: reconcile any PENDING gaps in OPEN cycles already covered by readings
+    const gapCleanupKey = 'sml_reconcile_pending_gaps_v1';
+    const gapsCleaned =
+      typeof localStorage !== 'undefined' &&
+      localStorage.getItem(gapCleanupKey) === '1';
+
+    if (!gapsCleaned) {
+      const openCycles = await db.cycles.where('status').equals('OPEN').toArray();
+      for (const c of openCycles) {
+        if (c.id === undefined) continue;
+        const mainReadings = await db.readings
+          .where('cycle_id')
+          .equals(c.id)
+          .filter((r) => r.meter_id === c.meter_id)
+          .toArray();
+        for (const r of mainReadings) {
+          await reconcilePendingGapsWithReading(
+            c.id,
+            c.meter_id,
+            r.prev_reading_tenths,
+            r.curr_reading_tenths
+          );
+        }
+      }
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(gapCleanupKey, '1');
       }
     }
   });

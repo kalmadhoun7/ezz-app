@@ -342,6 +342,14 @@ export async function addReading(
         sequence_order: mainSeq,
       })) as number;
 
+      // Reconcile any PENDING gaps that are fully or partially covered by this new reading
+      await reconcilePendingGapsWithReading(
+        input.cycle_id,
+        meter.id!,
+        input.prev_reading_tenths,
+        input.curr_reading_tenths
+      );
+
       // Re-normalize sequence_order by prev_reading_tenths so order stays clean
       if (
         overlapResolution === 'INSERT_AND_SHIFT' ||
@@ -585,4 +593,61 @@ export async function resolveOverlapBetweenReadings(params: {
       }
     }
   });
+}
+
+/**
+ * Automatically shrinks or resolves any PENDING gaps in `cycleId` that are
+ * partially or fully covered by a reading [newPrev, newCurr].
+ */
+export async function reconcilePendingGapsWithReading(
+  cycleId: number,
+  mainMeterId: number,
+  newPrev: number,
+  newCurr: number
+): Promise<void> {
+  if (newCurr <= newPrev) return;
+  const gaps = await db.pending_gaps
+    .where('cycle_id')
+    .equals(cycleId)
+    .filter((g) => g.meter_id === mainMeterId && g.status === 'PENDING')
+    .toArray();
+
+  for (const g of gaps) {
+    if (g.id === undefined) continue;
+    const overlapStart = Math.max(g.from_reading_tenths, newPrev);
+    const overlapEnd = Math.min(g.to_reading_tenths, newCurr);
+    if (overlapEnd <= overlapStart) continue;
+
+    if (newPrev <= g.from_reading_tenths && newCurr >= g.to_reading_tenths) {
+      await db.pending_gaps.update(g.id, {
+        status: 'RESOLVED',
+        resolved_note: 'تمت التغطية بقراءة جديدة',
+      });
+    } else if (newPrev <= g.from_reading_tenths && newCurr < g.to_reading_tenths) {
+      await db.pending_gaps.update(g.id, {
+        from_reading_tenths: newCurr,
+        gap_tenths: g.to_reading_tenths - newCurr,
+      });
+    } else if (newPrev > g.from_reading_tenths && newCurr >= g.to_reading_tenths) {
+      await db.pending_gaps.update(g.id, {
+        to_reading_tenths: newPrev,
+        gap_tenths: newPrev - g.from_reading_tenths,
+      });
+    } else {
+      await db.pending_gaps.update(g.id, {
+        to_reading_tenths: newPrev,
+        gap_tenths: newPrev - g.from_reading_tenths,
+      });
+      await db.pending_gaps.add({
+        cycle_id: g.cycle_id,
+        meter_id: g.meter_id,
+        from_reading_tenths: newCurr,
+        to_reading_tenths: g.to_reading_tenths,
+        gap_tenths: g.to_reading_tenths - newCurr,
+        detected_at: g.detected_at,
+        status: 'PENDING',
+        resolved_note: '',
+      });
+    }
+  }
 }
